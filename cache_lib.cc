@@ -7,8 +7,8 @@
 
 class Cache::Impl {
   private:
-    size_type maxmem;
-    Evictor *evictor;
+    const size_type maxmem;
+    Evictor *const evictor;
 
     size_type usedmem = 0;
 
