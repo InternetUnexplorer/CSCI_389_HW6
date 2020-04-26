@@ -1,0 +1,9 @@
+---
+BasedOnStyle: LLVM
+
+AllowShortFunctionsOnASingleLine: Empty
+ConstructorInitializerIndentWidth: '0'
+IncludeBlocks: Regroup
+IndentWidth: '4'
+
+...
