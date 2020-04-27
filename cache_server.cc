@@ -389,7 +389,7 @@ int run_server(const int argc, const char *const argv[]) {
     const auto endpoint = get_endpoint(host, port);
 
     // Create the I/O context
-    net::io_context context;
+    net::io_context context{static_cast<int>(num_threads)};
 
     // Add a handler to stop the I/O context on SIGINT/SIGTERM
     net::signal_set quit_signals{context, SIGINT, SIGTERM};

@@ -8,8 +8,6 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
-#include <mutex>
-#include <random>
 #include <thread>
 #include <vector>
 
@@ -23,7 +21,7 @@ constexpr WorkloadParams PARAMS = {
 };
 
 /// Number of requests per thread (should be a power of 2)
-constexpr auto NUM_REQUESTS = 1 << 16; // 1,048,576
+constexpr auto NUM_REQUESTS = 1 << 20; // ~1M (1,048,576)
 
 /// Minimum and maximum number of threads to spawn (must be powers of 2)
 constexpr auto NUM_THREADS_MIN = 1;
@@ -33,7 +31,7 @@ constexpr auto NUM_THREADS_MAX = 128;
 constexpr auto SERVER_ADDRESS = "localhost";
 constexpr auto SERVER_PORT = "4022";
 constexpr auto SERVER_MAXMEM = 1 << 16; // 64KiB
-constexpr auto SERVER_THREADS = 16;
+const auto SERVER_THREADS = std::max(1U, std::thread::hardware_concurrency());
 
 using generator_type = RequestGenerator<std::mt19937>;
 
@@ -174,42 +172,45 @@ latency_stats_type threaded_latencies(const unsigned nreq,
     return std::make_pair(latencies, stats);
 }
 
-using perf_stats_type = std::pair<std::pair<float, float>, RequestStatistics>;
-
-/// Convert a `latency_stats_type` value into a `perf_stats_type` value
-perf_stats_type compute_performance(latency_stats_type &&latency_stats,
-                                    const unsigned nreq) {
-    auto latencies = latency_stats.first;
-    // Calculate the total amount of time of all of the requests in seconds
+// Measure the completion time of `nreq` requests and return the mean
+// throughput (req/s) and the 95th-percentile latency (ms)
+std::pair<float, float> baseline_performance(const unsigned nreq,
+                                             const WorkloadParams &params) {
+    // Get the request latency numbers
+    auto latencies = baseline_latencies(nreq, params).first;
+    // Calculate the total amount of time of all of the requests
     const auto total_time =
-        std::accumulate(latencies.begin(), latencies.end(), 0.0f) / 1e3f;
+        std::accumulate(latencies.begin(), latencies.end(), 0.0f);
     // Calculate the mean throughput using the total time
-    const auto mean_throughput = nreq / total_time;
+    const auto mean_throughput = nreq / (total_time / 1e3f);
 
     // Sort the latency numbers and get the 95th-percentile latency
     std::sort(latencies.begin(), latencies.end(), std::greater<float>());
     const auto latency = latencies[static_cast<unsigned>(nreq * 0.95)];
 
-    // Return mean throughput, latency, and statistics
-    return std::make_pair(std::pair{mean_throughput, latency},
-                          latency_stats.second);
-}
-
-// Measure the completion time of `nreq` requests and return the mean
-// throughput (req/s) and the 95th-percentile latency (ms)
-perf_stats_type baseline_performance(const unsigned nreq,
-                                     const WorkloadParams &params) {
-    return compute_performance(baseline_latencies(nreq, params), nreq);
+    // Return mean throughput and latency
+    return std::pair{mean_throughput, latency};
 }
 
 // Measure the completion time of `nreq` requests per client for `nthreads`
 // clients on separate threads and return the mean throughput (req/s) and the
 // 95th-percentile latency (ms)
-perf_stats_type threaded_performance(const unsigned nreq,
-                                     const unsigned nthreads,
-                                     const WorkloadParams &params) {
-    return compute_performance(threaded_latencies(nreq, nthreads, params),
-                               nreq * nthreads);
+std::pair<float, float> threaded_performance(const unsigned nreq,
+                                             const unsigned nthreads,
+                                             const WorkloadParams &params) {
+    std::vector<float> latencies;
+    // Calculate the total amount of time of all of the requests
+    const auto total_time = measure_latency(
+        [&] { latencies = threaded_latencies(nreq, nthreads, params).first; });
+    // Calculate the mean throughput using the total time
+    const auto mean_throughput = (nreq * nthreads) / (total_time / 1e3f);
+
+    // Sort the latency numbers and get the 95th-percentile latency
+    std::sort(latencies.begin(), latencies.end(), std::greater<float>());
+    const auto latency = latencies[static_cast<unsigned>(nreq * 0.95)];
+
+    // Return mean throughput and latency
+    return std::pair{mean_throughput, latency};
 }
 
 /// Spawn the server as a child process and run the provided function after it
@@ -233,28 +234,46 @@ void run_with_server(const std::function<void()> &inner) {
 }
 
 int main() {
-    std::cout << "# Threads  Mean Req/s  95% Latency (µs)" << std::endl;
+    std::cout << "# Workload Parameters:" << std::endl;
+    std::cout << "#   prob_get = " << PARAMS.prob_get
+              << ", prob_set = " << PARAMS.prob_set
+              << ", prob_del = " << PARAMS.prob_del
+              << ", num_keys = " << PARAMS.num_keys
+              << ", val_size_dist = " << PARAMS.val_size_dist << std::endl;
+    std::cout << "#" << std::endl;
+
+    std::cout << "# Server Parameters:" << std::endl;
+    std::cout << "#   address = " << SERVER_ADDRESS
+              << ", port = " << SERVER_PORT << ", maxmem = " << SERVER_MAXMEM
+              << ", threads = " << SERVER_THREADS << std::endl;
+    std::cout << "#" << std::endl;
+
     // Spawn the server as a child process
     run_with_server([] {
         // Warm up the cache
         baseline_performance(NUM_REQUESTS, PARAMS);
 
+        std::cout << "# Threads  Mean Req/s  95% Latency (µs)" << std::endl;
+
+        // Start at `NUM_THREADS_MIN` and go up to `NUM_THREADS_MAX`, doubling
+        // the number of threads each iteration
         for (auto nthreads = NUM_THREADS_MIN; nthreads <= NUM_THREADS_MAX;
-             ++nthreads) {
+             nthreads *= 2) {
             // Measure throughput and latency
             const auto perf =
-                threaded_performance(NUM_REQUESTS, nthreads, PARAMS).first;
+                threaded_performance(NUM_REQUESTS, nthreads, PARAMS);
 
             // Output values
             std::cout << "  " << std::setw(7) << std::left << nthreads
                       << std::resetiosflags(std::cout.flags());
-            std::cout << "  " << std::setw(8) << std::left
+            std::cout << "  " << std::setw(10) << std::left
                       << static_cast<unsigned>(perf.first)
                       << std::resetiosflags(std::cout.flags());
-            std::cout << "  " << std::setw(6) << std::internal << std::fixed
+            std::cout << "  " << std::setw(8) << std::left << std::fixed
                       << std::setprecision(1) << perf.second * 1000.0f
                       << std::resetiosflags(std::cout.flags());
-            std::cout << std::endl;
+            std::cout << "  # " << (NUM_REQUESTS / nthreads)
+                      << " requests per thread" << std::endl;
         }
     });
 }
