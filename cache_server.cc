@@ -296,12 +296,14 @@ class Connection : public std::enable_shared_from_this<Connection> {
 /// Class representing a TCP listener capable of accepting `Connection`s
 class Listener : public std::enable_shared_from_this<Listener> {
   private:
+    net::io_context &context;
     tcp::acceptor acceptor;
     std::shared_ptr<SharedCache> cache;
 
     /// Accept an incoming connection asynchronously
     void do_accept() {
-        acceptor.async_accept(beast::bind_front_handler(&Listener::on_accept,
+        acceptor.async_accept(net::make_strand(context),
+                              beast::bind_front_handler(&Listener::on_accept,
                                                         shared_from_this()));
     }
 
@@ -318,7 +320,7 @@ class Listener : public std::enable_shared_from_this<Listener> {
   public:
     Listener(net::io_context &context, const tcp::endpoint &endpoint,
              std::shared_ptr<SharedCache> cache)
-    : acceptor{net::make_strand(context)}, cache{std::move(cache)} {
+    : context{context}, acceptor{net::make_strand(context)}, cache{cache} {
         // Configure the acceptor and bind it to the endpoint
         acceptor.open(endpoint.protocol());
         acceptor.set_option(net::socket_base::reuse_address(true));
