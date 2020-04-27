@@ -27,10 +27,54 @@ constexpr auto SOCKET_TIMEOUT = std::chrono::seconds(10);
 const std::regex KEY_RE{R"(/([A-Za-z0-9\._-]+))"};
 const std::regex KEY_VALUE_RE{R"(/([A-Za-z0-9\._-]+)/([A-Za-z0-9\._-]+))"};
 
+/// Thread-safe wrapper over a `Cache`
+class SharedCache {
+  private:
+    std::unique_ptr<Cache> cache;
+    std::mutex mutex;
+
+  public:
+    SharedCache(std::unique_ptr<Cache> cache) : cache{std::move(cache)} {}
+
+    /// Wrapper over `Cache::set` that takes a string value
+    void set(const std::string &key, const std::string &val) {
+        std::lock_guard lock{mutex};
+        cache->set(key, val.c_str(), val.size() + 1);
+    }
+
+    /// Wrapper over `Cache::get` that copies the returned value into a string
+    /// (returns "" if the value was not found)
+    std::string get(const std::string &key) {
+        std::lock_guard lock{mutex};
+        Cache::size_type size;
+        Cache::val_type value = cache->get(key, size);
+        return value != nullptr ? std::string{value, size - 1} : "";
+    }
+
+    /// Wrapper over `Cache::del`
+    bool del(const key_type &key) {
+        std::lock_guard lock{mutex};
+        return cache->del(key);
+    }
+
+    /// Wrapper over `Cache::space_used`
+    Cache::size_type space_used() {
+        std::lock_guard lock{mutex};
+        return cache->space_used();
+    }
+
+    /// Wrapper over `Cache::reset`
+    void reset() {
+        std::lock_guard lock{mutex};
+        cache->reset();
+    }
+};
+
+/// Class representing a client connection
 class Connection : public std::enable_shared_from_this<Connection> {
   private:
     beast::tcp_stream stream;
-    std::shared_ptr<Cache> cache;
+    std::shared_ptr<SharedCache> cache;
 
     // These values are stored in the class so that they stay alive throughout
     // the duration of an async operation
@@ -114,16 +158,15 @@ class Connection : public std::enable_shared_from_this<Connection> {
                 make_empty_response(http::status::bad_request, request));
         }
         // Fetch the value from the cache
-        Cache::size_type size;
-        Cache::val_type value = cache->get(*key, size);
+        std::string value = cache->get(*key);
         // Check whether the value was found
-        if (value != nullptr) {
+        if (value != "") {
             // Send 200 OK with a JSON body containing the key-value pair
             auto response =
                 make_response<http::string_body>(http::status::ok, request);
             response.set(http::field::content_type, "application/json");
-            response.body() = R"({"key":")" + *key + R"(","value":")" +
-                              std::string(value, size - 1) + R"("})";
+            response.body() =
+                R"({"key":")" + *key + R"(","value":")" + value + R"("})";
             response.prepare_payload();
             do_write(response);
         } else {
@@ -142,8 +185,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
                 make_empty_response(http::status::bad_request, request));
         }
         // Set the value and send 200 OK
-        cache->set(kv_pair->first, kv_pair->second.c_str(),
-                   kv_pair->second.size() + 1);
+        cache->set(kv_pair->first, kv_pair->second);
         do_write(make_empty_response(http::status::ok, request));
     }
 
@@ -242,7 +284,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
     }
 
   public:
-    Connection(tcp::socket &&socket, std::shared_ptr<Cache> cache)
+    Connection(tcp::socket &&socket, std::shared_ptr<SharedCache> cache)
     : stream{std::move(socket)}, cache{std::move(cache)} {}
 
     /// Start reading requests
@@ -251,17 +293,16 @@ class Connection : public std::enable_shared_from_this<Connection> {
     }
 };
 
-class Server : public std::enable_shared_from_this<Server> {
+/// Class representing a TCP listener capable of accepting `Connection`s
+class Listener : public std::enable_shared_from_this<Listener> {
   private:
     tcp::acceptor acceptor;
-    // No need to synchronize access to the cache since the server is
-    // single-threaded for now (everything runs in a single implicit strand)
-    std::shared_ptr<Cache> cache;
+    std::shared_ptr<SharedCache> cache;
 
     /// Accept an incoming connection asynchronously
     void do_accept() {
-        acceptor.async_accept(
-            beast::bind_front_handler(&Server::on_accept, shared_from_this()));
+        acceptor.async_accept(beast::bind_front_handler(&Listener::on_accept,
+                                                        shared_from_this()));
     }
 
     /// Handle the result of an accept
@@ -275,9 +316,9 @@ class Server : public std::enable_shared_from_this<Server> {
     }
 
   public:
-    Server(net::io_context &context, const tcp::endpoint &endpoint,
-           std::unique_ptr<Cache> cache)
-    : acceptor{context}, cache{std::move(cache)} {
+    Listener(net::io_context &context, const tcp::endpoint &endpoint,
+             std::shared_ptr<SharedCache> cache)
+    : acceptor{net::make_strand(context)}, cache{std::move(cache)} {
         // Configure the acceptor and bind it to the endpoint
         acceptor.open(endpoint.protocol());
         acceptor.set_option(net::socket_base::reuse_address(true));
@@ -316,7 +357,7 @@ int run_server(const int argc, const char *const argv[]) {
     options.add_options()("port,p", po::value<uint16_t>()->default_value(4022),
                           "set server port");
     options.add_options()("threads,t", po::value<unsigned>()->default_value(1),
-                          "set number of threads (NYI)");
+                          "set number of threads");
 
     // Parse command-line arguments
     po::variables_map config;
@@ -340,14 +381,7 @@ int run_server(const int argc, const char *const argv[]) {
     const auto maxmem = config["maxmem"].as<Cache::size_type>();
     const auto host = config["server"].as<std::string>();
     const auto port = config["port"].as<uint16_t>();
-    const auto threads = config["threads"].as<unsigned>();
-
-    // Warn if number of threads != 1
-    if (threads != 1) {
-        std::cerr
-            << "warning: setting the number of threads is not supported yet"
-            << std::endl;
-    }
+    const auto num_threads = config["threads"].as<unsigned>();
 
     // Resolve the endpoint
     const auto endpoint = get_endpoint(host, port);
@@ -360,18 +394,27 @@ int run_server(const int argc, const char *const argv[]) {
     quit_signals.async_wait(
         [&](beast::error_code const &, int) { context.stop(); });
 
-    // Create the cache and the server
-    auto cache = std::make_unique<Cache>(maxmem);
-    std::make_shared<Server>(context, endpoint, std::move(cache))->run();
+    // Create the cache and the listener
+    auto cache = std::make_shared<SharedCache>(std::make_unique<Cache>(maxmem));
+    std::make_shared<Listener>(context, endpoint, cache)->run();
 
-    // Print that the server has been started
+    // Queue sending a message indicating that that the server has been started
     context.post([&] {
         std::cout << "running on " << endpoint.address() << " port "
                   << endpoint.port() << std::endl;
     });
 
-    // Run the I/O context
-    context.run();
+    // Run the I/O context on `threads` worker threads
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (auto i = 0U; i < num_threads; ++i) {
+        threads.emplace_back([&context] { context.run(); });
+    }
+
+    // Wait for all of the worker threads to exit
+    for (auto &thread : threads) {
+        thread.join();
+    }
 
     // Terminate normally
     return 0;
