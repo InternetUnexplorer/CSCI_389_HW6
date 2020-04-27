@@ -1,0 +1,25 @@
+# Workload Parameters:
+#   prob_get = 15, prob_set = 8, prob_del = 1, num_keys = 1000, val_size_dist = 0.08
+#
+# Server Parameters:
+#   address = localhost, port = 4022, maxmem = 65536, threads = 1
+#
+# Sending 1048576 requests per client thread
+#
+# Threads  Mean Req/s  95% Latency (µs)
+  1        38233       20.6
+  2        67685       28.9
+  3        73318       40.9
+  4        75099       54.1
+  5        75709       68.0
+  6        73454       89.7
+  7        73362       105.8
+  8        72602       121.4
+  9        73577       135.3
+  10       74477       149.7
+  11       74126       167.1
+  12       72106       185.5
+  13       73924       198.7
+  14       72795       215.9
+  15       71635       231.7
+  16       73325       248.0
