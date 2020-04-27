@@ -32,4 +32,5 @@ target_link_libraries(test_cache_client ${Boost_LIBRARIES} Threads::Threads)
 
 add_executable(request_driver
                request_driver.cc request_generator.cc cache_client.cc)
+add_dependencies(request_driver cache_server)
 target_link_libraries(request_driver ${Boost_LIBRARIES} Threads::Threads)
