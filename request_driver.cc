@@ -20,14 +20,15 @@ constexpr WorkloadParams PARAMS = {
     0.08, // val_size_dist
 };
 
-/// Number of requests per thread (should be a power of 2)
+/// Number of requests per thread
 constexpr auto NUM_REQUESTS = 1 << 20; // ~1M (1,048,576)
 
-/// Minimum and maximum number of threads to spawn (must be powers of 2)
-constexpr auto NUM_THREADS_MIN = 1;
+/// Maximum number of threads to spawn (should be a power of 2)
 constexpr auto NUM_THREADS_MAX = 128;
+/// Amount to increase number of threads by each iteration
+constexpr auto NUM_THREADS_STEP = 4;
 
-// Server parameters
+/// Server parameters
 constexpr auto SERVER_ADDRESS = "localhost";
 constexpr auto SERVER_PORT = "4022";
 constexpr auto SERVER_MAXMEM = 1 << 16; // 64KiB
@@ -248,6 +249,10 @@ int main() {
               << ", threads = " << SERVER_THREADS << std::endl;
     std::cout << "#" << std::endl;
 
+    std::cout << "# Sending " << NUM_REQUESTS << " requests per client thread"
+              << std::endl;
+    std::cout << "#" << std::endl;
+
     // Spawn the server as a child process
     run_with_server([] {
         // Warm up the cache
@@ -257,8 +262,11 @@ int main() {
 
         // Start at `NUM_THREADS_MIN` and go up to `NUM_THREADS_MAX`, doubling
         // the number of threads each iteration
-        for (auto nthreads = NUM_THREADS_MIN; nthreads <= NUM_THREADS_MAX;
-             nthreads *= 2) {
+        for (auto threads = 0; threads <= NUM_THREADS_MAX;
+             threads += NUM_THREADS_STEP) {
+            // Require at least one thread
+            const auto nthreads = std::max(1, threads);
+
             // Measure throughput and latency
             const auto perf =
                 threaded_performance(NUM_REQUESTS, nthreads, PARAMS);
@@ -269,11 +277,10 @@ int main() {
             std::cout << "  " << std::setw(10) << std::left
                       << static_cast<unsigned>(perf.first)
                       << std::resetiosflags(std::cout.flags());
-            std::cout << "  " << std::setw(8) << std::left << std::fixed
-                      << std::setprecision(1) << perf.second * 1000.0f
+            std::cout << "  " << std::fixed << std::setprecision(1)
+                      << perf.second * 1000.0f
                       << std::resetiosflags(std::cout.flags());
-            std::cout << "  # " << (NUM_REQUESTS / nthreads)
-                      << " requests per thread" << std::endl;
+            std::cout << std::endl;
         }
     });
 }
