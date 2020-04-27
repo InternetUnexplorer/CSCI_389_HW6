@@ -5,7 +5,9 @@
 #include <chrono>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <random>
+#include <thread>
 #include <vector>
 
 constexpr WorkloadParams PARAMS = {
@@ -20,6 +22,8 @@ constexpr auto NUM_REQUESTS = 500000; // 500k
 
 constexpr auto CACHE_HOST = "localhost";
 constexpr auto CACHE_PORT = "4022";
+
+std::mutex mtx;
 
 using generator_type = RequestGenerator<std::mt19937>;
 
@@ -115,6 +119,48 @@ std::vector<float> baseline_latencies(unsigned nreq,
     return latencies;
 }
 
+// Measure the completion time of `nreq` requests in milliseconds (and record
+// statistics on request frequency, hit rate, etc.)
+void baseline_latencies_thread(std::vector<float> &latencies, unsigned nreq,
+                               const WorkloadParams &params, Cache &cache,
+                               RequestStatistics &stats) {
+    generator_type generator;
+    for (auto i = 0u; i < nreq; ++i) {
+        // Generate a request
+        const auto request = generator(params);
+        // Create a function to handle the result
+        std::function<void()> request_fn;
+
+        switch (request.type) {
+        case Request::Type::GET:
+            request_fn = [&] {
+                Cache::size_type size;
+                stats.num_get_hits += cache.get(request.key, size) != nullptr;
+                stats.num_gets++;
+            };
+            break;
+        case Request::Type::SET:
+            request_fn = [&] {
+                const std::string value = *request.value;
+                cache.set(request.key, value.c_str(), value.length() + 1);
+                stats.num_sets++;
+            };
+            break;
+        case Request::Type::DEL:
+            request_fn = [&] {
+                stats.num_del_hits += cache.del(request.key);
+                stats.num_dels++;
+            };
+            break;
+        }
+
+        // Measure latency of request
+        mtx.lock();
+        latencies.push_back(measure_latency(request_fn));
+        mtx.unlock();
+    }
+}
+
 // Measure the completion time of `nreq` requests and return the mean throughput
 // (req/s) and the 95th-percentile latency (ms)
 std::pair<float, float> baseline_performance(unsigned nreq,
@@ -125,6 +171,37 @@ std::pair<float, float> baseline_performance(unsigned nreq,
     auto latencies = baseline_latencies(nreq, params, cache, stats);
 
     // Calculate the total amount of time of all of the requests in seconds
+    const auto total_time =
+        std::accumulate(latencies.begin(), latencies.end(), 0.0f) / 1e3f;
+    // Calculate the mean throughput using the total time
+    const auto mean_throughput = nreq / total_time;
+
+    // Sort the latency numbers and get the 95th-percentile latency
+    std::sort(latencies.begin(), latencies.end(), std::greater<float>());
+    const auto latency = latencies[static_cast<unsigned>(nreq * 0.95)];
+
+    // Return mean throughput and latency
+    return std::pair{mean_throughput, latency};
+}
+
+// Measure the completion time of `nthreads` threads with `nreq` requests each
+// and return the mean throughput
+// (req/s) and the 95th-percentile latency (ms)
+std::pair<float, float> threaded_performance(unsigned nthreads, unsigned nreq,
+                                             const WorkloadParams &params,
+                                             Cache &cache,
+                                             RequestStatistics &stats) {
+    std::vector<std::thread> thread_vec;
+    std::vector<float> latencies(nreq);
+    for (auto i = 0; i < nthreads; ++i) {
+        thread_vec.emplace_back([&]() {
+            baseline_latencies_thread(latencies, nreq, params, cache, stats);
+        });
+    }
+    for (auto &t : thread_vec) {
+        t.join();
+    }
+
     const auto total_time =
         std::accumulate(latencies.begin(), latencies.end(), 0.0f) / 1e3f;
     // Calculate the mean throughput using the total time
