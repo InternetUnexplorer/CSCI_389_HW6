@@ -1,6 +1,5 @@
 #include "cache.hh"
 
-#include <cassert>
 #include <numeric>
 #include <unordered_map>
 #include <vector>
